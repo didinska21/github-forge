@@ -15,6 +15,8 @@ All state lives in memory; nothing is persisted.
 """
 
 import base64
+import datetime
+import difflib
 import hashlib
 import http.client
 import json
@@ -663,15 +665,610 @@ def check_auth(headers):
 # --------------------------------------------------------------------------
 # Surface routers (filled in stage by stage; each returns a reply tuple)
 
+def repo_json(repo):
+    owner = repo.owner or STORE.viewer or ""
+    return {
+        "id": repo.id,
+        "name": repo.name,
+        "full_name": "%s/%s" % (owner, repo.name),
+        "private": repo.private,
+        "description": repo.description,
+        "default_branch": repo.default_branch,
+        "owner": {"login": owner},
+    }
+
+
+def issue_json(issue):
+    return {
+        "id": issue["id"],
+        "number": issue["number"],
+        "title": issue["title"],
+        "body": issue["body"],
+        "state": issue["state"],
+        "labels": [{"name": name} for name in issue["labels"]],
+    }
+
+
+def pull_json(repo, pull):
+    head_sha = repo.refs.get("refs/heads/" + pull["head"], "")
+    base_sha = repo.refs.get("refs/heads/" + pull["base"], "")
+    obj = {
+        "id": pull["id"],
+        "number": pull["number"],
+        "state": pull["state"],
+        "title": pull["title"],
+        "body": pull["body"],
+        "head": {"ref": pull["head"], "sha": head_sha},
+        "base": {"ref": pull["base"], "sha": base_sha},
+        "merged": pull["merged"],
+    }
+    if pull["merged"]:
+        obj["merged_at"] = pull["merged_at"]
+        obj["merge_commit_sha"] = pull["merge_commit_sha"]
+    return obj
+
+
+def resolve_ref(repo, ref):
+    """Branch name, full ref, tag name or commit sha -> commit oid or None."""
+    if ref is None:
+        ref = repo.default_branch
+    if ref in repo.refs:
+        target = repo.refs[ref]
+        return peel_to_commit(repo, target) or target
+    for prefix in ("refs/heads/", "refs/tags/"):
+        if prefix + ref in repo.refs:
+            return peel_to_commit(repo, repo.refs[prefix + ref])
+    if len(ref) == 40 and commit_info(repo, ref) is not None:
+        return ref
+    return None
+
+
+def flat_at(repo, commit_oid):
+    if commit_oid is None:
+        return {}
+    info = commit_info(repo, commit_oid)
+    if info is None:
+        return {}
+    return flatten_tree(repo, info[0])
+
+
+def iso_now():
+    ts = EPOCH_BASE + STORE.clock
+    moment = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def squash_merge(repo, pull):
+    """File-level 3-way squash merge (§B.4). -> (ok, conflict, commit oid)"""
+    base_tip = repo.refs.get("refs/heads/" + pull["base"])
+    head_tip = repo.refs.get("refs/heads/" + pull["head"])
+    if base_tip is None or head_tip is None:
+        return False, True, None
+    base_commit = peel_to_commit(repo, base_tip) or base_tip
+    head_commit = peel_to_commit(repo, head_tip) or head_tip
+    mb = merge_base(repo, base_commit, head_commit)
+    mb_flat = flat_at(repo, mb)
+    base_flat = flat_at(repo, base_commit)
+    head_flat = flat_at(repo, head_commit)
+    merged = dict(base_flat)
+    paths = set(mb_flat) | set(base_flat) | set(head_flat)
+    for path in paths:
+        before = mb_flat.get(path)
+        current = base_flat.get(path)
+        incoming = head_flat.get(path)
+        if incoming != before and current == before:
+            if incoming is None:
+                merged.pop(path, None)
+            else:
+                merged[path] = incoming
+        elif current != before and incoming == before:
+            pass
+        elif incoming == current:
+            pass
+        else:
+            return False, True, None
+    tree_oid = build_tree(repo, merged)
+    message = pull["title"]
+    if pull["body"]:
+        message = message + "\n\n" + pull["body"]
+    commit = make_commit(repo, tree_oid, [base_commit], message)
+    repo.refs["refs/heads/" + pull["base"]] = commit
+    return True, False, commit
+
+
+def pull_files(repo, pull):
+    """Changed paths between the merge-base and the head tip, with counts."""
+    base_tip = repo.refs.get("refs/heads/" + pull["base"])
+    head_tip = repo.refs.get("refs/heads/" + pull["head"])
+    if base_tip is None or head_tip is None:
+        return []
+    base_commit = peel_to_commit(repo, base_tip) or base_tip
+    head_commit = peel_to_commit(repo, head_tip) or head_tip
+    mb = merge_base(repo, base_commit, head_commit)
+    base_flat = flat_at(repo, mb)
+    head_flat = flat_at(repo, head_commit)
+    out = []
+    for path in sorted(set(base_flat) | set(head_flat)):
+        before = base_flat.get(path)
+        after = head_flat.get(path)
+        if before == after:
+            continue
+        if before is None:
+            status = "added"
+        elif after is None:
+            status = "removed"
+        else:
+            status = "modified"
+        before_lines = _blob_lines(repo, before)
+        after_lines = _blob_lines(repo, after)
+        additions = deletions = 0
+        matcher = difflib.SequenceMatcher(None, before_lines, after_lines, autojunk=False)
+        for op, i1, i2, j1, j2 in matcher.get_opcodes():
+            if op in ("replace", "delete"):
+                deletions += i2 - i1
+            if op in ("replace", "insert"):
+                additions += j2 - j1
+        out.append({
+            "filename": path,
+            "status": status,
+            "additions": additions,
+            "deletions": deletions,
+            "changes": additions + deletions,
+        })
+    return out
+
+
+def _blob_lines(repo, flat_entry):
+    if flat_entry is None:
+        return []
+    entry = repo.objects.get(flat_entry[1])
+    if entry is None:
+        return []
+    return entry[1].decode("utf-8", "replace").splitlines()
+
+
+def _parse_body(body):
+    """-> (dict, error reply or None). Empty body parses as {}."""
+    if not body:
+        return {}, None
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, error_reply(400, "Problems parsing JSON")
+    if not isinstance(data, dict):
+        return None, error_reply(400, "Problems parsing JSON")
+    return data, None
+
+
+def _q1(query, name, default=None):
+    values = query.get(name)
+    return values[0] if values else default
+
+
+def _page_params(query):
+    try:
+        per_page = int(_q1(query, "per_page", "30"))
+    except ValueError:
+        per_page = 30
+    try:
+        page = int(_q1(query, "page", "1"))
+    except ValueError:
+        page = 1
+    return max(1, per_page), max(1, page)
+
+
 def rest_route(method, path, query, headers, body):
-    # Filled in by the REST stage; the lifecycle stage serves root + 404.
     if path in ("/api/v3", "/api/v3/"):
-        if not check_auth(headers):
-            return error_reply(401, "Bad credentials")
         return json_reply(200, {
             "current_user_url": "/api/v3/user",
             "rate_limit_url": "/api/v3/rate_limit",
         }, [("X-OAuth-Scopes", "repo, read:org")])
+    if path == "/api/v3/meta" and method == "GET":
+        return json_reply(200, {"installed_version": "1.0.0"})
+    if path == "/api/v3/user" and method == "GET":
+        return json_reply(200, {"login": STORE.viewer or ""})
+    if path == "/api/v3/user/repos":
+        if method == "POST":
+            return _create_repo(body)
+        if method == "GET":
+            return _list_user_repos(query, headers)
+
+    parts = [seg for seg in path.split("/") if seg != ""]
+    # parts: ['api', 'v3', 'repos', owner, name, ...]
+    if len(parts) >= 5 and parts[0] == "api" and parts[1] == "v3" and parts[2] == "repos":
+        owner, name = parts[3], parts[4]
+        repo = STORE.find_repo(owner, name)
+        if repo is None:
+            return error_reply(404, "Not Found")
+        tail = parts[5:]
+        return _repo_route(repo, method, tail, query, body)
+    return error_reply(404, "Not Found")
+
+
+def _create_repo(body):
+    data, err = _parse_body(body)
+    if err is not None:
+        return err
+    name = data.get("name")
+    if not isinstance(name, str) or not name:
+        return error_reply(422, "name is required")
+    repo = STORE.create_repo(name, bool(data.get("private", False)),
+                             data.get("description") or "")
+    if repo is None:
+        return error_reply(422, "name already exists on this account")
+    return json_reply(201, repo_json(repo))
+
+
+def _list_user_repos(query, headers):
+    per_page, page = _page_params(query)
+    repos = [STORE.repos_by_name[name] for name in
+             sorted(STORE.repos_by_name, key=lambda n: STORE.repos_by_name[n].id)]
+    repos = [r for r in repos if r.owner is None or STORE.viewer is None
+             or r.owner == STORE.viewer]
+    total = len(repos)
+    start = (page - 1) * per_page
+    chunk = repos[start:start + per_page]
+    extra = []
+    if start + per_page < total:
+        host = headers.get("Host", "127.0.0.1")
+        base = "http://%s/api/v3/user/repos" % host
+        links = ['<%s?per_page=%d&page=%d>; rel="next"' % (base, per_page, page + 1),
+                 '<%s?per_page=%d&page=%d>; rel="last"' % (
+                     base, per_page, max(1, (total + per_page - 1) // per_page))]
+        extra.append(("Link", ", ".join(links)))
+    return json_reply(200, [repo_json(r) for r in chunk], extra)
+
+
+def _repo_route(repo, method, tail, query, body):
+    if not tail:
+        if method == "GET":
+            return json_reply(200, repo_json(repo))
+        if method == "PATCH":
+            data, err = _parse_body(body)
+            if err is not None:
+                return err
+            if "description" in data:
+                repo.description = data["description"] or ""
+            if "private" in data:
+                repo.private = bool(data["private"])
+            return json_reply(200, repo_json(repo))
+        if method == "DELETE":
+            del STORE.repos_by_name[repo.name]
+            return 204, JSON_CT, b"", [("X-GitHub-Request-Id", STORE.request_id())]
+        return error_reply(404, "Not Found")
+
+    if tail[0] == "git" and len(tail) >= 2 and tail[1] == "refs":
+        if method == "POST" and len(tail) == 2:
+            return _create_ref(repo, body)
+        if method == "GET" and len(tail) >= 4 and tail[2] == "heads":
+            branch = "/".join(tail[3:])
+            sha = repo.refs.get("refs/heads/" + branch)
+            if sha is None:
+                return error_reply(404, "Not Found")
+            return json_reply(200, {"ref": "refs/heads/" + branch,
+                                    "object": {"sha": sha, "type": "commit"}})
+        return error_reply(404, "Not Found")
+
+    if tail[0] == "branches":
+        if method == "GET" and len(tail) == 1:
+            out = []
+            for ref in sorted(repo.refs):
+                if ref.startswith("refs/heads/"):
+                    out.append({"name": ref[len("refs/heads/"):],
+                                "commit": {"sha": repo.refs[ref]}})
+            return json_reply(200, out)
+        if method == "GET" and len(tail) >= 2:
+            branch = "/".join(tail[1:])
+            sha = repo.refs.get("refs/heads/" + branch)
+            if sha is None:
+                return error_reply(404, "Not Found")
+            return json_reply(200, {"name": branch, "commit": {"sha": sha}})
+        return error_reply(404, "Not Found")
+
+    if tail[0] == "commits" and len(tail) == 1 and method == "GET":
+        tip = resolve_ref(repo, _q1(query, "sha"))
+        if tip is None:
+            return json_reply(200, [])
+        out = []
+        for oid in history_list(repo, tip):
+            info = commit_info(repo, oid)
+            message = info[2].decode("utf-8", "replace") if info else ""
+            out.append({"sha": oid, "commit": {"message": message}})
+        return json_reply(200, out)
+
+    if tail[0] == "contents" and len(tail) >= 2:
+        cpath = "/".join(tail[1:])
+        if method == "PUT":
+            return _contents_put(repo, cpath, body)
+        if method == "GET":
+            return _contents_get(repo, cpath, _q1(query, "ref"))
+        if method == "DELETE":
+            return _contents_delete(repo, cpath, body)
+        return error_reply(404, "Not Found")
+
+    if tail[0] == "labels" and len(tail) == 1 and method == "POST":
+        data, err = _parse_body(body)
+        if err is not None:
+            return err
+        lname = data.get("name")
+        if not isinstance(lname, str) or not lname:
+            return error_reply(422, "name is required")
+        repo.labels[lname] = data.get("color") or ""
+        return json_reply(201, {"name": lname, "color": repo.labels[lname]})
+
+    if tail[0] == "issues":
+        return _issues_route(repo, method, tail[1:], query, body)
+
+    if tail[0] == "pulls":
+        return _pulls_route(repo, method, tail[1:], query, body)
+
+    return error_reply(404, "Not Found")
+
+
+def _create_ref(repo, body):
+    data, err = _parse_body(body)
+    if err is not None:
+        return err
+    ref = data.get("ref")
+    sha = data.get("sha")
+    if not isinstance(ref, str) or not ref.startswith("refs/"):
+        return error_reply(422, "ref is invalid")
+    if not isinstance(sha, str) or commit_info(repo, sha) is None:
+        return error_reply(422, "sha is not a commit in this repository")
+    if ref in repo.refs:
+        return error_reply(422, "Reference already exists")
+    repo.refs[ref] = sha
+    return json_reply(201, {"ref": ref, "object": {"sha": sha, "type": "commit"}})
+
+
+def _contents_put(repo, cpath, body):
+    data, err = _parse_body(body)
+    if err is not None:
+        return err
+    try:
+        raw = base64.b64decode(data.get("content") or "", validate=False)
+    except (ValueError, TypeError):
+        return error_reply(422, "content is not valid base64")
+    branch = data.get("branch") or repo.default_branch
+    tip = repo.refs.get("refs/heads/" + branch)
+    if tip is None and branch != repo.default_branch:
+        tip = repo.refs.get("refs/heads/" + repo.default_branch)
+    tip_commit = peel_to_commit(repo, tip) if tip else None
+    flat = flat_at(repo, tip_commit)
+    existing = flat.get(cpath)
+    sha_given = data.get("sha")
+    if existing is not None and sha_given is not None \
+            and str(sha_given).lower() != existing[1].lower():
+        return error_reply(409, "sha does not match the current content")
+    blob_oid = store_object(repo, "blob", raw)
+    flat[cpath] = ("100644", blob_oid)
+    tree_oid = build_tree(repo, flat)
+    parents = [tip_commit] if tip_commit else []
+    commit = make_commit(repo, tree_oid, parents, data.get("message") or "")
+    repo.refs["refs/heads/" + branch] = commit
+    status = 201 if existing is None else 200
+    return json_reply(status, {
+        "content": {"name": cpath.split("/")[-1], "path": cpath,
+                    "sha": blob_oid, "encoding": "base64"},
+        "commit": {"sha": commit},
+    })
+
+
+def _contents_get(repo, cpath, ref):
+    tip = resolve_ref(repo, ref)
+    if tip is None:
+        return error_reply(404, "Not Found")
+    info = commit_info(repo, tip)
+    if info is None:
+        return error_reply(404, "Not Found")
+    node = info[0]
+    parts = [p for p in cpath.split("/") if p != ""]
+    for depth, part in enumerate(parts):
+        entries = tree_entries(repo, node)
+        found = None
+        for mode, name, oid in entries:
+            if name == part:
+                found = (mode, oid)
+                break
+        if found is None:
+            return error_reply(404, "Not Found")
+        mode, oid = found
+        if depth == len(parts) - 1:
+            if mode == "40000":
+                return json_reply(200, _dir_listing(repo, oid, cpath))
+            entry = repo.objects.get(oid)
+            payload = entry[1] if entry else b""
+            return json_reply(200, {
+                "type": "file",
+                "encoding": "base64",
+                "content": base64.b64encode(payload).decode(),
+                "sha": oid,
+                "size": len(payload),
+                "name": part,
+                "path": cpath,
+            })
+        if mode != "40000":
+            return error_reply(404, "Not Found")
+        node = oid
+    return json_reply(200, _dir_listing(repo, node, cpath))
+
+
+def _dir_listing(repo, tree_oid, cpath):
+    out = []
+    for mode, name, oid in tree_entries(repo, tree_oid):
+        child_path = (cpath.rstrip("/") + "/" + name) if cpath else name
+        out.append({
+            "type": "dir" if mode == "40000" else "file",
+            "name": name,
+            "path": child_path,
+            "sha": oid,
+        })
+    return out
+
+
+def _contents_delete(repo, cpath, body):
+    data, err = _parse_body(body)
+    if err is not None:
+        return err
+    branch = data.get("branch") or repo.default_branch
+    tip = repo.refs.get("refs/heads/" + branch)
+    tip_commit = peel_to_commit(repo, tip) if tip else None
+    flat = flat_at(repo, tip_commit)
+    existing = flat.get(cpath)
+    if existing is None:
+        return error_reply(404, "Not Found")
+    sha_given = data.get("sha")
+    if sha_given is not None and str(sha_given).lower() != existing[1].lower():
+        return error_reply(409, "sha does not match the current content")
+    del flat[cpath]
+    tree_oid = build_tree(repo, flat)
+    parents = [tip_commit] if tip_commit else []
+    commit = make_commit(repo, tree_oid, parents, data.get("message") or "")
+    repo.refs["refs/heads/" + branch] = commit
+    return json_reply(200, {"commit": {"sha": commit}, "content": None})
+
+
+def _issues_route(repo, method, tail, query, body):
+    if not tail:
+        if method == "POST":
+            data, err = _parse_body(body)
+            if err is not None:
+                return err
+            labels = data.get("labels") or []
+            for lname in labels:
+                if lname not in repo.labels:
+                    return error_reply(422, "label %s does not exist" % lname)
+            number = repo.next_issue
+            repo.next_issue += 1
+            issue = {
+                "id": STORE.entity_id(),
+                "number": number,
+                "title": data.get("title") or "",
+                "body": data.get("body") or "",
+                "state": "open",
+                "labels": list(labels),
+                "comments": [],
+            }
+            repo.issues[number] = issue
+            return json_reply(201, issue_json(issue))
+        if method == "GET":
+            state = _q1(query, "state", "open")
+            items = [i for i in repo.issues.values()
+                     if state == "all" or i["state"] == state]
+            direction = _q1(query, "direction", "desc")
+            items.sort(key=lambda i: i["number"], reverse=(direction != "asc"))
+            per_page, page = _page_params(query)
+            start = (page - 1) * per_page
+            return json_reply(200, [issue_json(i) for i in items[start:start + per_page]])
+        return error_reply(404, "Not Found")
+
+    if not tail[0].isdigit():
+        return error_reply(404, "Not Found")
+    number = int(tail[0])
+    issue = repo.issues.get(number)
+    if issue is None:
+        return error_reply(404, "Not Found")
+    if len(tail) == 1:
+        if method == "GET":
+            return json_reply(200, issue_json(issue))
+        if method == "PATCH":
+            data, err = _parse_body(body)
+            if err is not None:
+                return err
+            if data.get("state") in ("open", "closed"):
+                issue["state"] = data["state"]
+            if "title" in data:
+                issue["title"] = data["title"] or ""
+            if "body" in data:
+                issue["body"] = data["body"] or ""
+            return json_reply(200, issue_json(issue))
+        return error_reply(404, "Not Found")
+    if len(tail) == 2 and tail[1] == "comments":
+        if method == "POST":
+            data, err = _parse_body(body)
+            if err is not None:
+                return err
+            comment = {"id": STORE.entity_id(), "body": data.get("body") or ""}
+            issue["comments"].append(comment)
+            return json_reply(201, dict(comment))
+        if method == "GET":
+            return json_reply(200, [dict(c) for c in issue["comments"]])
+    return error_reply(404, "Not Found")
+
+
+def _pulls_route(repo, method, tail, query, body):
+    if not tail:
+        if method == "POST":
+            data, err = _parse_body(body)
+            if err is not None:
+                return err
+            head = data.get("head")
+            base = data.get("base")
+            if not isinstance(head, str) or not isinstance(base, str):
+                return error_reply(422, "head and base are required")
+            if "refs/heads/" + head not in repo.refs:
+                return error_reply(422, "head branch does not exist")
+            if "refs/heads/" + base not in repo.refs:
+                return error_reply(422, "base branch does not exist")
+            for pull in repo.pulls.values():
+                if pull["state"] == "open" and pull["head"] == head \
+                        and pull["base"] == base:
+                    return error_reply(422, "A pull request already exists "
+                                            "for this head and base")
+            number = repo.next_pull
+            repo.next_pull += 1
+            pull = {
+                "id": STORE.entity_id(),
+                "number": number,
+                "title": data.get("title") or "",
+                "body": data.get("body") or "",
+                "state": "open",
+                "head": head,
+                "base": base,
+                "merged": False,
+                "merged_at": None,
+                "merge_commit_sha": None,
+            }
+            repo.pulls[number] = pull
+            return json_reply(201, pull_json(repo, pull))
+        if method == "GET":
+            state = _q1(query, "state", "open")
+            items = [p for p in repo.pulls.values()
+                     if state == "all" or p["state"] == state]
+            items.sort(key=lambda p: p["number"], reverse=True)
+            per_page, page = _page_params(query)
+            start = (page - 1) * per_page
+            return json_reply(200, [pull_json(repo, p)
+                                    for p in items[start:start + per_page]])
+        return error_reply(404, "Not Found")
+
+    if not tail[0].isdigit():
+        return error_reply(404, "Not Found")
+    number = int(tail[0])
+    pull = repo.pulls.get(number)
+    if len(tail) == 1 and method == "GET":
+        if pull is None:
+            return error_reply(404, "Not Found")
+        return json_reply(200, pull_json(repo, pull))
+    if pull is None:
+        return error_reply(404, "Not Found")
+    if len(tail) == 2 and tail[1] == "files" and method == "GET":
+        return json_reply(200, pull_files(repo, pull))
+    if len(tail) == 2 and tail[1] == "merge" and method == "PUT":
+        data, err = _parse_body(body)
+        if err is not None:
+            return err
+        if pull["state"] == "closed":
+            return error_reply(405, "Pull Request is not mergeable")
+        ok, conflict, commit = squash_merge(repo, pull)
+        if conflict:
+            return error_reply(405, "Pull Request is not mergeable")
+        pull["state"] = "closed"
+        pull["merged"] = True
+        pull["merged_at"] = iso_now()
+        pull["merge_commit_sha"] = commit
+        return json_reply(200, {"sha": commit, "merged": True,
+                                "message": "Pull Request successfully merged"})
     return error_reply(404, "Not Found")
 
 

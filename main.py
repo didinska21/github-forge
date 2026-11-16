@@ -2216,8 +2216,221 @@ def graphql_route(method, path, query, headers, body):
     return json_reply(400, {"errors": [{"message": "Invalid request body"}]})
 
 
+# --------------------------------------------------------------------------
+# MCP (JSON-RPC 2.0, modern era: server/discover, no sessions)
+
+def _mcp_tool(name, description, properties, required):
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        },
+    }
+
+
+_STR = {"type": "string"}
+MCP_TOOLS = [
+    _mcp_tool("create_repo", "Create a repository.",
+              {"name": _STR, "description": _STR, "private": {"type": "boolean"}},
+              ["name"]),
+    _mcp_tool("get_repo", "Get a repository by owner and name.",
+              {"owner": _STR, "repo": _STR}, ["owner", "repo"]),
+    _mcp_tool("create_issue", "Create an issue in a repository.",
+              {"owner": _STR, "repo": _STR, "title": _STR, "body": _STR},
+              ["owner", "repo", "title"]),
+    _mcp_tool("list_issues", "List the issues of a repository.",
+              {"owner": _STR, "repo": _STR, "state": _STR},
+              ["owner", "repo"]),
+    _mcp_tool("create_pull_request", "Create a pull request.",
+              {"owner": _STR, "repo": _STR, "title": _STR, "head": _STR,
+               "base": _STR, "body": _STR},
+              ["owner", "repo", "title", "head", "base"]),
+    _mcp_tool("merge_pull_request", "Merge a pull request (squash).",
+              {"owner": _STR, "repo": _STR, "pull_number": {"type": "integer"}},
+              ["owner", "repo", "pull_number"]),
+]
+MCP_TOOLS_BY_NAME = {tool["name"]: tool for tool in MCP_TOOLS}
+MCP_SERVER_INFO = {"name": "forge", "version": "1.0.0"}
+MCP_DISCOVER_RESULT = {
+    "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18",
+                          "2025-03-26", "2024-11-05"],
+    "capabilities": {"tools": {}},
+    "serverInfo": MCP_SERVER_INFO,
+    "_meta": {"io.modelcontextprotocol/serverInfo": MCP_SERVER_INFO},
+}
+
+
+class _McpToolError(Exception):
+    pass
+
+
+def _mcp_result(rid, result):
+    return {"jsonrpc": "2.0", "id": rid, "result": result}
+
+
+def _mcp_error(rid, code, message):
+    return {"jsonrpc": "2.0", "id": rid,
+            "error": {"code": code, "message": message}}
+
+
+def _mcp_find_repo(args):
+    repo = STORE.find_repo(str(args.get("owner") or ""),
+                           str(args.get("repo") or ""))
+    if repo is None:
+        raise _McpToolError("repository not found")
+    return repo
+
+
+def _mcp_call_tool(name, args):
+    if name == "create_repo":
+        repo = STORE.create_repo(str(args.get("name")),
+                                 bool(args.get("private", False)),
+                                 args.get("description") or "")
+        if repo is None:
+            raise _McpToolError("repository already exists")
+        return repo_json(repo)
+    if name == "get_repo":
+        return repo_json(_mcp_find_repo(args))
+    if name == "create_issue":
+        repo = _mcp_find_repo(args)
+        number = repo.next_issue
+        repo.next_issue += 1
+        issue = {
+            "id": STORE.entity_id(),
+            "number": number,
+            "title": args.get("title") or "",
+            "body": args.get("body") or "",
+            "state": "open",
+            "labels": [],
+            "comments": [],
+        }
+        repo.issues[number] = issue
+        return issue_json(issue)
+    if name == "list_issues":
+        repo = _mcp_find_repo(args)
+        state = str(args.get("state") or "open")
+        items = [i for i in sorted(repo.issues.values(),
+                                   key=lambda i: i["number"])
+                 if state == "all" or i["state"] == state]
+        return {"issues": [issue_json(i) for i in items],
+                "total_count": len(items)}
+    if name == "create_pull_request":
+        repo = _mcp_find_repo(args)
+        head = str(args.get("head") or "")
+        base = str(args.get("base") or "")
+        if "refs/heads/" + head not in repo.refs:
+            raise _McpToolError("head branch does not exist")
+        if "refs/heads/" + base not in repo.refs:
+            raise _McpToolError("base branch does not exist")
+        for pull in repo.pulls.values():
+            if pull["state"] == "open" and pull["head"] == head \
+                    and pull["base"] == base:
+                raise _McpToolError("a pull request already exists for "
+                                    "this head and base")
+        number = repo.next_pull
+        repo.next_pull += 1
+        pull = {
+            "id": STORE.entity_id(),
+            "number": number,
+            "title": args.get("title") or "",
+            "body": args.get("body") or "",
+            "state": "open",
+            "head": head,
+            "base": base,
+            "merged": False,
+            "merged_at": None,
+            "merge_commit_sha": None,
+        }
+        repo.pulls[number] = pull
+        return pull_json(repo, pull)
+    if name == "merge_pull_request":
+        repo = _mcp_find_repo(args)
+        try:
+            number = int(args.get("pull_number"))
+        except (TypeError, ValueError):
+            raise _McpToolError("pull_number must be an integer")
+        pull = repo.pulls.get(number)
+        if pull is None:
+            raise _McpToolError("pull request not found")
+        if not pull["merged"]:
+            if pull["state"] == "closed":
+                raise _McpToolError("Pull Request is not mergeable")
+            ok, conflict, commit = squash_merge(repo, pull)
+            if conflict or not ok:
+                raise _McpToolError("Pull Request is not mergeable")
+            pull["state"] = "closed"
+            pull["merged"] = True
+            pull["merged_at"] = iso_now()
+            pull["merge_commit_sha"] = commit
+        return pull_json(repo, pull)
+    raise _McpToolError("unknown tool")
+
+
+def _mcp_handle(req):
+    rid = req.get("id")
+    method = req.get("method")
+    params = req.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    if method == "server/discover":
+        return _mcp_result(rid, MCP_DISCOVER_RESULT)
+    if method == "initialize":
+        return _mcp_result(rid, {
+            "protocolVersion": params.get("protocolVersion") or "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": MCP_SERVER_INFO,
+        })
+    if method == "tools/list":
+        return _mcp_result(rid, {"tools": MCP_TOOLS})
+    if method == "ping":
+        return _mcp_result(rid, {})
+    if method == "tools/call":
+        name = params.get("name")
+        tool = MCP_TOOLS_BY_NAME.get(name) if isinstance(name, str) else None
+        if tool is None:
+            return _mcp_error(rid, -32602, "unknown tool: %s" % (name,))
+        args = params.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        for required in tool["inputSchema"]["required"]:
+            if args.get(required) is None:
+                return _mcp_error(rid, -32602,
+                                  "missing required argument: %s" % required)
+        try:
+            payload = _mcp_call_tool(name, args)
+        except _McpToolError as exc:
+            text = json.dumps({"error": str(exc)}, separators=(",", ":"))
+            return _mcp_result(rid, {
+                "content": [{"type": "text", "text": text}],
+                "isError": True,
+            })
+        return _mcp_result(rid, {
+            "content": [{"type": "text",
+                         "text": json.dumps(payload, separators=(",", ":"))}],
+            "structuredContent": payload,
+            "isError": False,
+        })
+    return _mcp_error(rid, -32601, "method not found: %s" % (method,))
+
+
 def mcp_route(method, path, query, headers, body):
-    return error_reply(404, "Not Found")
+    if method != "POST":
+        return error_reply(404, "Not Found")
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else None
+    except (ValueError, UnicodeDecodeError):
+        return json_reply(400, _mcp_error(None, -32700, "Parse error"))
+    if isinstance(payload, list):
+        return json_reply(200, [_mcp_handle(item) for item in payload
+                                if isinstance(item, dict)])
+    if isinstance(payload, dict):
+        if "id" not in payload:  # a notification: accepted, no response body
+            return 202, JSON_CT, b"", []
+        return json_reply(200, _mcp_handle(payload))
+    return json_reply(400, _mcp_error(None, -32700, "Parse error"))
 
 
 # --------------------------------------------------------------------------

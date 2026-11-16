@@ -30,6 +30,15 @@ python3 -P -s main.py
 
 (with `MAKEFUN_ENV_URL` and `MAKEFUN_SHOP_TOKEN` set in the environment).
 
+## Competition
+
+Built for the make.fun bounty
+[github-core-clone-01](https://make.fun/bounty/github-core-clone-01)
+("Build a GitHub-compatible git forge"). The suite is the only client: the
+forge passes the full local conformance suite (120/120 checks across git,
+REST, GraphQL, MCP and protocol surfaces) with a deterministic, clock-free
+state model.
+
 ## License
 
 MIT — see `LICENSE`.

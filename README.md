@@ -1,5 +1,9 @@
 # GitHub Forge Clone
 
+[![Competition](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
+[![Rank](https://make.fun/badge/github-core-clone-01/didinska21/github-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01)
+[![Reward](https://make.fun/badge/github-core-clone-01/didinska21/github-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+
 A standalone, GitHub-compatible git forge in a single Python file (`main.py`,
 standard library only). One process serves four surfaces from its own
 in-memory store:

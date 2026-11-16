@@ -1494,8 +1494,726 @@ def git_route(method, segments, query, headers, body):
     return error_reply(404, "Not Found")
 
 
+# --------------------------------------------------------------------------
+# GraphQL v4 (a small purpose-built executor for the suite's documents)
+
+class _GqlError(Exception):
+    pass
+
+
+def _gql_tokens(text):
+    tokens = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n,":
+            i += 1
+            continue
+        if ch == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if text.startswith("...", i):
+            tokens.append(("...", "..."))
+            i += 3
+            continue
+        if ch in "{}()[]:$=!|@":
+            tokens.append((ch, ch))
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            if j >= n:
+                raise _GqlError("unterminated string")
+            try:
+                tokens.append(("STRING", json.loads(text[i:j + 1])))
+            except ValueError:
+                raise _GqlError("bad string literal")
+            i = j + 1
+            continue
+        if ch.isdigit() or (ch == "-" and i + 1 < n and text[i + 1].isdigit()):
+            j = i + 1
+            while j < n and (text[j].isdigit() or text[j] in ".eE+-"):
+                j += 1
+            raw = text[i:j]
+            try:
+                value = float(raw) if any(c in raw for c in ".eE") else int(raw)
+            except ValueError:
+                raise _GqlError("bad number literal")
+            tokens.append(("NUMBER", value))
+            i = j
+            continue
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            tokens.append(("NAME", text[i:j]))
+            i = j
+            continue
+        raise _GqlError("unexpected character %r" % ch)
+    tokens.append(("EOF", None))
+    return tokens
+
+
+class _GqlParser:
+    def __init__(self, text):
+        self.tokens = _gql_tokens(text)
+        self.pos = 0
+
+    def peek(self):
+        return self.tokens[self.pos]
+
+    def next(self):
+        token = self.tokens[self.pos]
+        self.pos += 1
+        return token
+
+    def expect(self, kind):
+        token = self.next()
+        if token[0] != kind:
+            raise _GqlError("expected %s, saw %s" % (kind, token[0]))
+        return token[1]
+
+    def parse_document(self):
+        operations, fragments = [], {}
+        while self.peek()[0] != "EOF":
+            kind, value = self.peek()
+            if kind == "{":
+                operations.append({"type": "query", "name": None,
+                                     "selection": self.parse_selection_set()})
+            elif kind == "NAME" and value in ("query", "mutation"):
+                self.next()
+                name = None
+                if self.peek()[0] == "NAME":
+                    name = self.next()[1]
+                if self.peek()[0] == "(":
+                    self.parse_variable_definitions()
+                operations.append({"type": value, "name": name,
+                                     "selection": self.parse_selection_set()})
+            elif kind == "NAME" and value == "fragment":
+                self.next()
+                fname = self.expect("NAME")
+                if self.expect("NAME") != "on":
+                    raise _GqlError("fragment without 'on'")
+                typecond = self.expect("NAME")
+                fragments[fname] = (typecond, self.parse_selection_set())
+            else:
+                raise _GqlError("unexpected token %s" % (value,))
+        return {"operations": operations, "fragments": fragments}
+
+    def parse_variable_definitions(self):
+        self.expect("(")
+        while self.peek()[0] != ")":
+            self.expect("$")
+            self.expect("NAME")
+            self.expect(":")
+            self.parse_type()
+            if self.peek()[0] == "=":
+                self.next()
+                self.parse_value()
+        self.expect(")")
+
+    def parse_type(self):
+        if self.peek()[0] == "[":
+            self.next()
+            self.parse_type()
+            self.expect("]")
+        else:
+            self.expect("NAME")
+        if self.peek()[0] == "!":
+            self.next()
+
+    def parse_selection_set(self):
+        self.expect("{")
+        selections = []
+        while self.peek()[0] != "}":
+            selections.append(self.parse_selection())
+        self.expect("}")
+        return selections
+
+    def parse_selection(self):
+        if self.peek()[0] == "...":
+            self.next()
+            if self.peek()[0] == "NAME" and self.peek()[1] == "on":
+                self.next()
+                typecond = self.expect("NAME")
+                return ("fragment", typecond, self.parse_selection_set())
+            if self.peek()[0] == "NAME":
+                return ("spread", self.next()[1])
+            return ("fragment", None, self.parse_selection_set())
+        name = self.expect("NAME")
+        alias = None
+        if self.peek()[0] == ":":
+            self.next()
+            alias, name = name, self.expect("NAME")
+        args = {}
+        if self.peek()[0] == "(":
+            args = self.parse_arguments()
+        selection = None
+        if self.peek()[0] == "{":
+            selection = self.parse_selection_set()
+        return ("field", alias, name, args, selection)
+
+    def parse_arguments(self):
+        self.expect("(")
+        args = {}
+        while self.peek()[0] != ")":
+            key = self.expect("NAME")
+            self.expect(":")
+            args[key] = self.parse_value()
+        self.expect(")")
+        return args
+
+    def parse_value(self):
+        kind, value = self.next()
+        if kind == "$":
+            return ("var", self.expect("NAME"))
+        if kind in ("STRING", "NUMBER"):
+            return value
+        if kind == "NAME":
+            if value == "true":
+                return True
+            if value == "false":
+                return False
+            if value == "null":
+                return None
+            return value  # enum literal reads as its name
+        if kind == "[":
+            items = []
+            while self.peek()[0] != "]":
+                items.append(self.parse_value())
+            self.expect("]")
+            return ("list", items)
+        if kind == "{":
+            obj = {}
+            while self.peek()[0] != "}":
+                key = self.expect("NAME")
+                self.expect(":")
+                obj[key] = self.parse_value()
+            self.expect("}")
+            return ("object", obj)
+        raise _GqlError("unexpected value token %s" % kind)
+
+
+def _gql_eval(value, variables):
+    if isinstance(value, tuple):
+        if value[0] == "var":
+            return variables.get(value[1])
+        if value[0] == "list":
+            return [_gql_eval(item, variables) for item in value[1]]
+        if value[0] == "object":
+            return {k: _gql_eval(v, variables) for k, v in value[1].items()}
+    return value
+
+
+class GObj:
+    __slots__ = ("type", "data")
+
+    def __init__(self, type_, data):
+        self.type = type_
+        self.data = data
+
+
+def _gid(kind, *parts):
+    raw = ":".join([kind] + [str(p) for p in parts])
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _ungid(gid):
+    try:
+        padded = str(gid) + "=" * (-len(str(gid)) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode()).decode()
+        parts = raw.split(":")
+        return parts[0], parts[1:]
+    except Exception:
+        return None, []
+
+
+def _repo_by_id(rid):
+    for repo in STORE.repos_by_name.values():
+        if repo.id == rid:
+            return repo
+    return None
+
+
+def _node_from_gid(gid):
+    kind, parts = _ungid(gid)
+    try:
+        if kind == "Repository" and len(parts) == 1:
+            repo = _repo_by_id(int(parts[0]))
+            return GObj("Repository", repo) if repo is not None else None
+        if kind == "Issue" and len(parts) == 2:
+            repo = _repo_by_id(int(parts[0]))
+            issue = repo.issues.get(int(parts[1])) if repo else None
+            return GObj("Issue", (repo, issue)) if issue is not None else None
+        if kind == "PullRequest" and len(parts) == 2:
+            repo = _repo_by_id(int(parts[0]))
+            pull = repo.pulls.get(int(parts[1])) if repo else None
+            return GObj("PullRequest", (repo, pull)) if pull is not None else None
+        if kind == "IssueComment" and len(parts) == 2:
+            repo = _repo_by_id(int(parts[0]))
+            if repo is not None:
+                for issue in repo.issues.values():
+                    for comment in issue["comments"]:
+                        if comment["id"] == int(parts[1]):
+                            return GObj("IssueComment", (repo, issue, comment))
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+_GQL_TYPE_FIELDS = {
+    "Issue": ["id", "number", "title", "state", "body", "bodyText", "url",
+              "author", "labels", "comments", "createdAt", "updatedAt",
+              "closedAt"],
+    "PullRequest": ["id", "number", "title", "body", "state", "merged",
+                    "mergeable", "headRefName", "baseRefName", "files",
+                    "commits", "createdAt", "updatedAt", "closedAt"],
+    "Repository": ["id", "databaseId", "name", "nameWithOwner", "owner",
+                   "defaultBranchRef", "viewerPermission", "hasIssuesEnabled",
+                   "issue", "issues", "pullRequest", "pullRequests", "url",
+                   "description", "isPrivate", "createdAt", "updatedAt"],
+    "User": ["login", "id", "name", "url"],
+    "Ref": ["name", "target"],
+    "PageInfo": ["hasNextPage", "endCursor", "hasPreviousPage", "startCursor"],
+    "IssueConnection": ["nodes", "pageInfo", "totalCount"],
+    "PullRequestConnection": ["nodes", "pageInfo", "totalCount"],
+    "PullRequestChangedFile": ["path", "additions", "deletions"],
+    "PullRequestFilesConnection": ["nodes", "pageInfo", "totalCount"],
+    "IssueComment": ["id", "body", "author", "createdAt"],
+    "CreateIssuePayload": ["issue"],
+    "CloseIssuePayload": ["issue"],
+    "CreatePullRequestPayload": ["pullRequest"],
+    "MergePullRequestPayload": ["pullRequest"],
+    "AddCommentPayload": ["commentEdge"],
+    "CommentEdge": ["node", "cursor"],
+    "__Type": ["name", "kind", "fields", "enumValues"],
+    "__Field": ["name", "description"],
+    "__EnumValue": ["name", "description"],
+}
+
+_GQL_ENUM_VALUES = {
+    "SearchType": ["ISSUE", "REPOSITORY", "USER", "DISCUSSION"],
+    "IssueState": ["OPEN", "CLOSED"],
+    "PullRequestState": ["OPEN", "CLOSED", "MERGED"],
+    "MergeableState": ["MERGEABLE", "CONFLICTING", "UNKNOWN"],
+    "OrderDirection": ["ASC", "DESC"],
+}
+
+_UNKNOWN = object()
+
+
+def _pull_conflict(repo, pull):
+    """Read-only form of the §B.4 merge test (for GraphQL mergeable)."""
+    base_tip = repo.refs.get("refs/heads/" + pull["base"])
+    head_tip = repo.refs.get("refs/heads/" + pull["head"])
+    if base_tip is None or head_tip is None:
+        return True
+    base_commit = peel_to_commit(repo, base_tip) or base_tip
+    head_commit = peel_to_commit(repo, head_tip) or head_tip
+    mb = merge_base(repo, base_commit, head_commit)
+    mb_flat = flat_at(repo, mb)
+    base_flat = flat_at(repo, base_commit)
+    head_flat = flat_at(repo, head_commit)
+    for path in set(mb_flat) | set(base_flat) | set(head_flat):
+        before = mb_flat.get(path)
+        current = base_flat.get(path)
+        incoming = head_flat.get(path)
+        if incoming != before and current == before:
+            continue
+        if current != before and incoming == before:
+            continue
+        if incoming == current:
+            continue
+        return True
+    return False
+
+
+def _gql_issues_connection(repo, args):
+    items = sorted(repo.issues.values(), key=lambda i: i["number"])
+    states = args.get("states")
+    if states:
+        wanted = {str(s).upper() for s in states}
+        items = [i for i in items if i["state"].upper() in wanted]
+    order_by = args.get("orderBy")
+    direction = "ASC"
+    if isinstance(order_by, dict) and order_by.get("direction"):
+        direction = str(order_by["direction"]).upper()
+    if direction == "DESC":
+        items.reverse()
+    start = 0
+    after = args.get("after")
+    if after:
+        kind, parts = _ungid(after)
+        if kind == "cursor" and parts:
+            try:
+                last = int(parts[0])
+                for index, item in enumerate(items):
+                    if item["number"] == last:
+                        start = index + 1
+                        break
+            except ValueError:
+                pass
+    first = args.get("first")
+    page = items[start:start + first] if isinstance(first, int) else items[start:]
+    has_next = start + len(page) < len(items)
+    end_cursor = _gid("cursor", page[-1]["number"]) if page else (after or "")
+    data = {
+        "nodes": [GObj("Issue", (repo, i)) for i in page],
+        "pageInfo": GObj("PageInfo", {"hasNextPage": has_next,
+                                      "endCursor": end_cursor}),
+        "totalCount": len(items),
+    }
+    return GObj("IssueConnection", data)
+
+
+def _gql_field(typename, data, name, args):
+    if typename == "Query":
+        if name == "viewer":
+            return GObj("User", None)
+        if name == "repository":
+            repo = STORE.find_repo(str(args.get("owner") or ""),
+                                   str(args.get("name") or ""))
+            return GObj("Repository", repo) if repo is not None else None
+        if name == "node":
+            return _node_from_gid(args.get("id"))
+        if name == "__type":
+            tname = str(args.get("name") or "")
+            if tname in _GQL_TYPE_FIELDS or tname in _GQL_ENUM_VALUES:
+                return GObj("__Type", tname)
+            return None
+        return _UNKNOWN
+    if typename == "Mutation":
+        return _gql_mutation(name, args)
+    if typename == "User":
+        if name == "login":
+            return (data or STORE.viewer or "")
+        if name == "id":
+            return _gid("User", data or STORE.viewer or "")
+        return None if name in _GQL_TYPE_FIELDS["User"] else _UNKNOWN
+    if typename == "Repository":
+        repo = data
+        if repo is None:
+            return None
+        if name == "id":
+            return _gid("Repository", repo.id)
+        if name == "databaseId":
+            return repo.id
+        if name == "name":
+            return repo.name
+        if name == "nameWithOwner":
+            return "%s/%s" % (repo.owner or STORE.viewer or "", repo.name)
+        if name == "owner":
+            return GObj("User", repo.owner or STORE.viewer or "")
+        if name == "defaultBranchRef":
+            if "refs/heads/" + repo.default_branch in repo.refs:
+                return GObj("Ref", repo.default_branch)
+            return None
+        if name == "viewerPermission":
+            return "ADMIN"
+        if name == "hasIssuesEnabled":
+            return True
+        if name == "isPrivate":
+            return repo.private
+        if name == "description":
+            return repo.description
+        if name == "issue":
+            issue = repo.issues.get(args.get("number"))
+            return GObj("Issue", (repo, issue)) if issue is not None else None
+        if name == "issues":
+            return _gql_issues_connection(repo, args)
+        if name == "pullRequest":
+            pull = repo.pulls.get(args.get("number"))
+            return GObj("PullRequest", (repo, pull)) if pull is not None else None
+        if name == "pullRequests":
+            items = sorted(repo.pulls.values(),
+                           key=lambda p: p["number"], reverse=True)
+            first = args.get("first")
+            if isinstance(first, int):
+                items = items[:first]
+            return GObj("PullRequestConnection", {
+                "nodes": [GObj("PullRequest", (repo, p)) for p in items],
+                "pageInfo": GObj("PageInfo", {"hasNextPage": False,
+                                              "endCursor": ""}),
+                "totalCount": len(items),
+            })
+        return None if name in _GQL_TYPE_FIELDS["Repository"] else _UNKNOWN
+    if typename == "Ref":
+        if name == "name":
+            return data
+        return None
+    if typename == "Issue":
+        repo, issue = data
+        if name == "id":
+            return _gid("Issue", repo.id, issue["number"])
+        if name == "number":
+            return issue["number"]
+        if name == "title":
+            return issue["title"]
+        if name == "state":
+            return issue["state"].upper()
+        if name == "body":
+            return issue["body"]
+        return None if name in _GQL_TYPE_FIELDS["Issue"] else _UNKNOWN
+    if typename == "IssueConnection":
+        return data.get(name, _UNKNOWN)
+    if typename == "PageInfo":
+        return data.get(name)
+    if typename == "PullRequest":
+        repo, pull = data
+        if name == "id":
+            return _gid("PullRequest", repo.id, pull["number"])
+        if name == "number":
+            return pull["number"]
+        if name == "title":
+            return pull["title"]
+        if name == "body":
+            return pull["body"]
+        if name == "state":
+            return "MERGED" if pull["merged"] else pull["state"].upper()
+        if name == "merged":
+            return pull["merged"]
+        if name == "headRefName":
+            return pull["head"]
+        if name == "baseRefName":
+            return pull["base"]
+        if name == "mergeable":
+            return "CONFLICTING" if _pull_conflict(repo, pull) else "MERGEABLE"
+        if name == "files":
+            files = pull_files(repo, pull)
+            first = args.get("first")
+            if isinstance(first, int):
+                files = files[:first]
+            return GObj("PullRequestFilesConnection", {
+                "nodes": [GObj("PullRequestChangedFile", f) for f in files],
+                "pageInfo": GObj("PageInfo", {"hasNextPage": False,
+                                              "endCursor": ""}),
+                "totalCount": len(files),
+            })
+        return None if name in _GQL_TYPE_FIELDS["PullRequest"] else _UNKNOWN
+    if typename == "PullRequestConnection":
+        return data.get(name, _UNKNOWN)
+    if typename == "PullRequestFilesConnection":
+        return data.get(name, _UNKNOWN)
+    if typename == "PullRequestChangedFile":
+        if name == "path":
+            return data["filename"]
+        if name in ("additions", "deletions"):
+            return data[name]
+        return _UNKNOWN
+    if typename == "IssueComment":
+        repo, _issue, comment = data
+        if name == "id":
+            return _gid("IssueComment", repo.id, comment["id"])
+        if name == "body":
+            return comment["body"]
+        return None if name in _GQL_TYPE_FIELDS["IssueComment"] else _UNKNOWN
+    if typename in ("CreateIssuePayload", "CloseIssuePayload"):
+        if name == "issue":
+            return data
+        return _UNKNOWN
+    if typename in ("CreatePullRequestPayload", "MergePullRequestPayload"):
+        if name == "pullRequest":
+            return data
+        return _UNKNOWN
+    if typename == "AddCommentPayload":
+        if name == "commentEdge":
+            return data
+        return _UNKNOWN
+    if typename == "CommentEdge":
+        if name == "node":
+            return data
+        if name == "cursor":
+            return ""
+        return _UNKNOWN
+    if typename == "__Type":
+        if name == "name":
+            return data
+        if name == "kind":
+            return "ENUM" if data in _GQL_ENUM_VALUES else "OBJECT"
+        if name == "fields":
+            return [GObj("__Field", f) for f in _GQL_TYPE_FIELDS.get(data, [])]
+        if name == "enumValues":
+            return [GObj("__EnumValue", v)
+                    for v in _GQL_ENUM_VALUES.get(data, [])]
+        return _UNKNOWN
+    if typename in ("__Field", "__EnumValue"):
+        if name == "name":
+            return data
+        return None
+    return _UNKNOWN
+
+
+def _gql_mutation(name, args):
+    inp = args.get("input") or {}
+    if name == "createIssue":
+        kind, parts = _ungid(inp.get("repositoryId"))
+        repo = _repo_by_id(int(parts[0])) if kind == "Repository" and parts else None
+        if repo is None:
+            raise _GqlError("repository not found")
+        number = repo.next_issue
+        repo.next_issue += 1
+        issue = {
+            "id": STORE.entity_id(),
+            "number": number,
+            "title": inp.get("title") or "",
+            "body": inp.get("body") or "",
+            "state": "open",
+            "labels": [],
+            "comments": [],
+        }
+        repo.issues[number] = issue
+        return GObj("CreateIssuePayload", GObj("Issue", (repo, issue)))
+    if name == "closeIssue":
+        node = _node_from_gid(inp.get("issueId"))
+        if node is None or node.type != "Issue":
+            raise _GqlError("issue not found")
+        repo, issue = node.data
+        issue["state"] = "closed"
+        return GObj("CloseIssuePayload", GObj("Issue", (repo, issue)))
+    if name == "createPullRequest":
+        kind, parts = _ungid(inp.get("repositoryId"))
+        repo = _repo_by_id(int(parts[0])) if kind == "Repository" and parts else None
+        if repo is None:
+            raise _GqlError("repository not found")
+        number = repo.next_pull
+        repo.next_pull += 1
+        pull = {
+            "id": STORE.entity_id(),
+            "number": number,
+            "title": inp.get("title") or "",
+            "body": inp.get("body") or "",
+            "state": "open",
+            "head": inp.get("headRefName") or "",
+            "base": inp.get("baseRefName") or "",
+            "merged": False,
+            "merged_at": None,
+            "merge_commit_sha": None,
+        }
+        repo.pulls[number] = pull
+        return GObj("CreatePullRequestPayload", GObj("PullRequest", (repo, pull)))
+    if name == "mergePullRequest":
+        node = _node_from_gid(inp.get("pullRequestId"))
+        if node is None or node.type != "PullRequest":
+            raise _GqlError("pull request not found")
+        repo, pull = node.data
+        if not pull["merged"]:
+            if pull["state"] == "closed":
+                raise _GqlError("Pull Request is not mergeable")
+            ok, conflict, commit = squash_merge(repo, pull)
+            if conflict or not ok:
+                raise _GqlError("Pull Request is not mergeable")
+            pull["state"] = "closed"
+            pull["merged"] = True
+            pull["merged_at"] = iso_now()
+            pull["merge_commit_sha"] = commit
+        return GObj("MergePullRequestPayload", GObj("PullRequest", (repo, pull)))
+    if name == "addComment":
+        node = _node_from_gid(inp.get("subjectId"))
+        if node is None or node.type != "Issue":
+            raise _GqlError("subject not found")
+        repo, issue = node.data
+        comment = {"id": STORE.entity_id(), "body": inp.get("body") or ""}
+        issue["comments"].append(comment)
+        edge = GObj("CommentEdge", GObj("IssueComment", (repo, issue, comment)))
+        return GObj("AddCommentPayload", edge)
+    return _UNKNOWN
+
+
+def _gql_complete(value, selection, variables, fragments, errors):
+    if isinstance(value, GObj):
+        if selection is None:
+            return None
+        return _gql_exec(value, selection, variables, fragments, errors)
+    if isinstance(value, list):
+        return [_gql_complete(item, selection, variables, fragments, errors)
+                for item in value]
+    return value
+
+
+def _gql_exec(obj, selections, variables, fragments, errors):
+    result = {}
+    for sel in selections:
+        if sel[0] == "field":
+            _tag, alias, name, raw_args, subsel = sel
+            key = alias or name
+            if name == "__typename":
+                result[key] = obj.type
+                continue
+            args = {k: _gql_eval(v, variables) for k, v in raw_args.items()}
+            try:
+                value = _gql_field(obj.type, obj.data, name, args)
+            except _GqlError as exc:
+                errors.append({"message": str(exc)})
+                result[key] = None
+                continue
+            if value is _UNKNOWN:
+                errors.append({
+                    "message": "Field '%s' doesn't exist on type '%s'"
+                               % (name, obj.type),
+                })
+                result[key] = None
+                continue
+            result[key] = _gql_complete(value, subsel, variables,
+                                        fragments, errors)
+        elif sel[0] == "fragment":
+            _tag, typecond, subsel = sel
+            if typecond is None or typecond == obj.type:
+                result.update(_gql_exec(obj, subsel, variables,
+                                        fragments, errors))
+        elif sel[0] == "spread":
+            frag = fragments.get(sel[1])
+            if frag is not None and (frag[0] is None or frag[0] == obj.type):
+                result.update(_gql_exec(obj, frag[1], variables,
+                                        fragments, errors))
+    return result
+
+
+def _gql_execute_op(op):
+    if not isinstance(op, dict):
+        return {"data": None, "errors": [{"message": "Invalid operation"}]}
+    variables = op.get("variables") or {}
+    try:
+        doc = _GqlParser(str(op.get("query") or "")).parse_document()
+    except _GqlError as exc:
+        return {"data": None, "errors": [{"message": str(exc)}]}
+    operation = None
+    wanted = op.get("operationName")
+    for candidate in doc["operations"]:
+        if wanted is None or candidate["name"] == wanted:
+            operation = candidate
+            break
+    if operation is None:
+        return {"data": None, "errors": [{"message": "Operation not found"}]}
+    root = GObj("Mutation" if operation["type"] == "mutation" else "Query", None)
+    errors = []
+    data = _gql_exec(root, operation["selection"], variables,
+                     doc["fragments"], errors)
+    envelope = {"data": data}
+    if errors:
+        envelope["errors"] = errors
+    return envelope
+
+
 def graphql_route(method, path, query, headers, body):
-    return error_reply(404, "Not Found")
+    if method != "POST":
+        return error_reply(404, "Not Found")
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else None
+    except (ValueError, UnicodeDecodeError):
+        return json_reply(400, {"errors": [{"message": "Problems parsing JSON"}]})
+    if isinstance(payload, list):
+        return json_reply(200, [_gql_execute_op(op) for op in payload])
+    if isinstance(payload, dict):
+        return json_reply(200, _gql_execute_op(payload))
+    return json_reply(400, {"errors": [{"message": "Invalid request body"}]})
 
 
 def mcp_route(method, path, query, headers, body):

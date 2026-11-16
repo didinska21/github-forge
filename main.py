@@ -1272,7 +1272,225 @@ def _pulls_route(repo, method, tail, query, body):
     return error_reply(404, "Not Found")
 
 
+# --------------------------------------------------------------------------
+# Git smart HTTP
+
+GIT_ZERO = "0" * 40
+UPLOAD_CAPS_V0 = "side-band-64k thin-pack ofs-delta symref=HEAD:refs/heads/main"
+RECEIVE_CAPS_V0 = "report-status side-band-64k delete-refs ofs-delta"
+
+
+def _bin_reply(status, ctype, body):
+    return status, ctype, body, []
+
+
+def _git_advertisement(repo, service, version2):
+    if service == "git-upload-pack" and version2:
+        out = pkt(b"# service=git-upload-pack\n") + FLUSH
+        out += pkt(b"version 2\n")
+        out += pkt(b"ls-refs=unborn\n")
+        out += pkt(b"fetch=shallow\n")
+        out += pkt(b"object-format=sha1\n")
+        return out + FLUSH
+    caps = UPLOAD_CAPS_V0 if service == "git-upload-pack" else RECEIVE_CAPS_V0
+    out = pkt(("# service=%s\n" % service).encode()) + FLUSH
+    if not repo.refs:
+        return out + pkt(("%s capabilities^{}\0%s\n" % (GIT_ZERO, caps)).encode()) + FLUSH
+    lines = [("HEAD", repo.refs.get("refs/heads/main"))]
+    for name in sorted(repo.refs):
+        oid = repo.refs[name]
+        lines.append((name, oid))
+        entry = repo.objects.get(oid)
+        if entry is not None and entry[0] == "tag":
+            commit = peel_to_commit(repo, oid)
+            if commit is not None:
+                lines.append((name + "^{}", commit))
+    for index, (name, oid) in enumerate(lines):
+        line = "%s %s" % (oid if oid else GIT_ZERO, name)
+        if index == 0:
+            line += "\0" + caps
+        out += pkt((line + "\n").encode())
+    return out + FLUSH
+
+
+def _git_ls_refs(repo, args):
+    prefixes = [a.split(" ", 1)[1] for a in args if a.startswith("ref-prefix ")]
+    want_peel = "peel" in args
+    want_symrefs = "symrefs" in args
+    want_unborn = "unborn" in args
+
+    def matches(name):
+        return not prefixes or any(name.startswith(p) for p in prefixes)
+
+    out = b""
+    main_tip = repo.refs.get("refs/heads/main")
+    if matches("HEAD"):
+        suffix = " symref-target:refs/heads/main" if want_symrefs else ""
+        if main_tip is not None:
+            out += pkt(("%s HEAD%s\n" % (main_tip, suffix)).encode())
+        elif want_unborn:
+            out += pkt(("unborn HEAD%s\n" % suffix).encode())
+        else:
+            out += pkt(("%s HEAD%s\n" % (GIT_ZERO, suffix)).encode())
+    for name in sorted(repo.refs):
+        if not matches(name):
+            continue
+        oid = repo.refs[name]
+        line = "%s %s" % (oid, name)
+        entry = repo.objects.get(oid)
+        if want_peel and entry is not None and entry[0] == "tag":
+            commit = peel_to_commit(repo, oid)
+            if commit is not None:
+                line += " peeled:%s" % commit
+        out += pkt((line + "\n").encode())
+    return out + FLUSH
+
+
+def _git_fetch(repo, args):
+    wants, haves, client_shallow = [], [], []
+    depth = None
+    for arg in args:
+        if arg.startswith("want "):
+            wants.append(arg[5:])
+        elif arg.startswith("have "):
+            haves.append(arg[5:])
+        elif arg.startswith("shallow "):
+            client_shallow.append(arg[8:])
+        elif arg.startswith("deepen "):
+            try:
+                depth = int(arg[7:])
+            except ValueError:
+                pass
+    pack_oids, boundary, unshallow = compute_fetch_pack(
+        repo, wants, haves, client_shallow, depth)
+    pack = write_pack([repo.objects[oid] for oid in pack_oids])
+    out = b""
+    if boundary or unshallow:
+        out += pkt(b"shallow-info\n")
+        for oid in sorted(boundary):
+            out += pkt(("shallow %s\n" % oid).encode())
+        for oid in sorted(unshallow):
+            out += pkt(("unshallow %s\n" % oid).encode())
+        out += FLUSH
+    out += pkt(b"packfile\n")
+    for offset in range(0, len(pack), 60000):
+        out += pkt(b"\x01" + pack[offset:offset + 60000])
+    return out + FLUSH
+
+
+def _git_receive_pack(repo, body):
+    try:
+        lines, pos, special = parse_pkt_lines(body or b"")
+    except ValueError:
+        lines, pos, special = [], 0, "eof"
+    pack_data = body[pos:] if special == "flush" else b""
+    commands = []
+    client_caps = ""
+    for index, raw in enumerate(lines):
+        line = raw.decode("utf-8", "replace").rstrip("\n")
+        if index == 0 and "\0" in line:
+            line, client_caps = line.split("\0", 1)
+        parts = line.split(" ")
+        if len(parts) == 3 and len(parts[0]) == 40 and len(parts[1]) == 40:
+            commands.append((parts[0], parts[1], parts[2]))
+    unpack_ok = True
+    if pack_data:
+        try:
+            ingest_pack(repo, pack_data)
+        except Exception:
+            unpack_ok = False
+    results = []
+    for old, new, ref in commands:
+        current = repo.refs.get(ref)
+        reason = None
+        if not unpack_ok:
+            reason = "unpack failed"
+        elif new == GIT_ZERO:  # delete
+            if current is None:
+                reason = "reference does not exist"
+            elif old != GIT_ZERO and current != old:
+                reason = "stale ref"
+        elif old == GIT_ZERO:  # create
+            if current is not None:
+                reason = "already exists"
+            elif new not in repo.objects:
+                reason = "missing object"
+        else:  # update
+            if current != old:
+                reason = "stale ref"
+            elif new not in repo.objects:
+                reason = "missing object"
+            elif not ref.startswith("refs/tags/") and new != current:
+                info = commit_info(repo, new)
+                fast = info is not None and (
+                    current in info[1] or is_ancestor(repo, current, new))
+                if not fast:
+                    reason = "non-fast-forward"
+        if reason is None:
+            if new == GIT_ZERO:
+                repo.refs.pop(ref, None)
+            else:
+                repo.refs[ref] = new
+            results.append("ok %s\n" % ref)
+        else:
+            results.append("ng %s %s\n" % (ref, reason))
+    report = [("unpack ok\n" if unpack_ok else "unpack error\n")] + results
+    sideband = "side-band-64k" in client_caps.split(" ")
+    out = b""
+    for line in report:
+        encoded = pkt(line.encode())
+        out += pkt(b"\x01" + encoded) if sideband else encoded
+    return out + FLUSH
+
+
+def _v2_args(lines):
+    """Split a v2 command request into (command, args after the delim)."""
+    if not lines:
+        return None, []
+    first = lines[0].decode("utf-8", "replace").rstrip("\n")
+    if not first.startswith("command="):
+        return None, []
+    args = []
+    seen_delim = False
+    for raw in lines[1:]:
+        if raw == b"\x01":
+            seen_delim = True
+            continue
+        if seen_delim:
+            args.append(raw.decode("utf-8", "replace").rstrip("\n"))
+    return first[len("command="):], args
+
+
 def git_route(method, segments, query, headers, body):
+    owner = segments[0]
+    name = segments[1][:-len(".git")]
+    repo = STORE.find_repo(owner, name)
+    if repo is None:
+        return error_reply(404, "Not Found")
+    rest = segments[2:]
+    if rest == ["info", "refs"] and method == "GET":
+        service = _q1(query, "service", "")
+        if service not in ("git-upload-pack", "git-receive-pack"):
+            return error_reply(404, "Not Found")
+        version2 = headers.get("Git-Protocol") == "version=2"
+        return _bin_reply(200, "application/x-%s-advertisement" % service,
+                          _git_advertisement(repo, service, version2))
+    if rest == ["git-upload-pack"] and method == "POST":
+        try:
+            lines, _pos, _special = parse_pkt_lines(body or b"")
+        except ValueError:
+            return _bin_reply(400, "text/plain", b"malformed pkt-line\n")
+        command, args = _v2_args(lines)
+        if command == "ls-refs":
+            return _bin_reply(200, "application/x-git-upload-pack-result",
+                              _git_ls_refs(repo, args))
+        if command == "fetch":
+            return _bin_reply(200, "application/x-git-upload-pack-result",
+                              _git_fetch(repo, args))
+        return _bin_reply(400, "text/plain", b"unknown command\n")
+    if rest == ["git-receive-pack"] and method == "POST":
+        return _bin_reply(200, "application/x-git-receive-pack-result",
+                          _git_receive_pack(repo, body or b""))
     return error_reply(404, "Not Found")
 
 
